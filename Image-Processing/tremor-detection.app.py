@@ -331,41 +331,61 @@ def detect_tremor(res, rel_thr=0.3, amp_thr_deg=0.5, agree_hz=1.0, edge_hz=0.3):
 
 # ---------------------------------------------------------------- 모눈 자동 인식
 def paper_roi(rgb):
-    """첫 화면에서 가장 큰 밝은 영역(종이)의 사각형 (x0, y0, x1, y1). 못 찾으면 None."""
-    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    h, w = g.shape
-    sc = 800.0 / max(h, w)
-    sm = cv2.resize(g, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
-    sm = cv2.GaussianBlur(sm, (5, 5), 0)
-    _, bw = cv2.threshold(sm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))   # 모눈 선 메우기
-    n, lab, st_, _ = cv2.connectedComponentsWithStats(bw, 8)
-    if n <= 1:
+    """종이 영역 사각형 (x0, y0, x1, y1). 못 찾으면 None.
+    카메라는 종이를 향하므로 화면 가운데 색을 종이 색으로 보고, 그 색과 비슷한 영역 중
+    가운데와 이어진 덩어리를 종이로 본다. (밝기만 보면 나무 벽처럼 밝은 배경도 종이로 잡힘)"""
+    h, w = rgb.shape[:2]
+    sc = 600.0 / max(h, w)
+    sm = cv2.resize(rgb, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
+    sm = cv2.medianBlur(sm, 7)                                          # 모눈 선과 레이저 점을 지움
+    lab = cv2.cvtColor(sm, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hh, ww = lab.shape[:2]
+    c = lab[int(hh * 0.4):int(hh * 0.6), int(ww * 0.4):int(ww * 0.6)].reshape(-1, 3)
+    ref = np.median(c, axis=0)                                          # 종이 색 (화면 가운데)
+    wgt = np.array([0.5, 2.0, 2.0], np.float32)                         # 밝기 차이는 덜, 색깔 차이는 더 크게
+    dist = np.linalg.norm((lab - ref) * wgt, axis=2)                    # 종이 색과의 색 차이 (그림자에 덜 민감)
+    d8 = np.clip(dist * 2, 0, 255).astype(np.uint8)
+    thr, _ = cv2.threshold(d8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = (d8 <= thr).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, labm, st_, _ = cv2.connectedComponentsWithStats(mask, 8)
+    k = labm[hh // 2, ww // 2]
+    if k == 0:                                                          # 가운데가 종이가 아니면 가장 큰 덩어리
+        if n <= 1:
+            return None
+        k = 1 + np.argmax(st_[1:, cv2.CC_STAT_AREA])
+    if st_[k, cv2.CC_STAT_AREA] < 0.03 * mask.size:
         return None
-    k = 1 + np.argmax(st_[1:, cv2.CC_STAT_AREA])
-    if st_[k, cv2.CC_STAT_AREA] < 0.05 * sm.size:
-        return None
-    x, y, ww, hh = st_[k, :4]
-    return (int(x / sc), int(y / sc), int((x + ww) / sc), int((y + hh) / sc))
+    x, y, bw, bh = st_[k, :4]
+    return (int(x / sc), int(y / sc), int((x + bw) / sc), int((y + bh) / sc))
 
 
-def _pitch_1d(p):
-    """밝기 단면에서 반복 간격(px)을 자기상관으로 찾는다."""
-    p = np.asarray(p, float)
-    n = len(p)
-    if n < 40:
+def _pitch_1d(profiles):
+    """밝기 단면들에서 반복 간격(px)을 자기상관으로 찾는다.
+    종이가 조금 기울어도 되도록 짧은 띠마다 자기상관을 구해 평균한다."""
+    acs = []
+    for p in profiles:
+        p = np.asarray(p, float)
+        n = len(p)
+        if n < 40:
+            continue
+        win = max(5, n // 8) | 1
+        p = p - np.convolve(p, np.ones(win) / win, mode="same")
+        p = p[win:-win]
+        p = p - p.mean()
+        m = len(p)
+        f = np.fft.rfft(p, 2 * m)
+        ac = np.fft.irfft(f * np.conj(f))[:m]
+        if ac[0] > 0:
+            acs.append(ac / ac[0])
+    if not acs:
         return np.nan, 0.0
-    win = max(5, n // 8) | 1
-    p = p - np.convolve(p, np.ones(win) / win, mode="same")
-    p = p[win:-win]
-    p = p - p.mean()
-    m = len(p)
-    f = np.fft.rfft(p, 2 * m)
-    ac = np.fft.irfft(f * np.conj(f))[:m]
-    if ac[0] <= 0:
-        return np.nan, 0.0
-    ac = ac / ac[0]
+    m = min(len(a) for a in acs)
+    ac = np.mean([a[:m] for a in acs], axis=0)
     lo, hi = 4, m // 3
+    if hi <= lo + 3:
+        return np.nan, 0.0
     pk, pr = find_peaks(ac[lo:hi], prominence=0.05)
     if len(pk) == 0:
         return np.nan, 0.0
@@ -389,6 +409,15 @@ def _pitch_1d(p):
     return pitch, float(ac[first])
 
 
+def _strips(d, axis, n_strip=6):
+    """2차원 그림을 n_strip개의 띠로 나눠 각 띠의 평균 단면을 만든다."""
+    L = d.shape[1 - axis]
+    edges = np.linspace(0, L, n_strip + 1).astype(int)
+    if axis == 0:   # 세로로 평균 → 가로 위치별 단면 (세로선)
+        return [d[edges[i]:edges[i + 1], :].mean(axis=0) for i in range(n_strip) if edges[i + 1] > edges[i]]
+    return [d[:, edges[i]:edges[i + 1]].mean(axis=1) for i in range(n_strip) if edges[i + 1] > edges[i]]
+
+
 def grid_pitch(rgb, roi=None):
     """모눈 한 칸이 영상에서 몇 px인지 찾는다. 반환: dict(px, px_x, px_y, quality, ok)."""
     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(float)
@@ -397,8 +426,8 @@ def grid_pitch(rgb, roi=None):
         dx, dy = int(0.12 * (x1 - x0)), int(0.12 * (y1 - y0))
         g = g[y0 + dy:y1 - dy, x0 + dx:x1 - dx]
     d = 255.0 - g                                          # 선이 어두우므로 어두운 정도
-    px_x, qx = _pitch_1d(d.mean(axis=0))                   # 세로 선 → 가로 간격
-    px_y, qy = _pitch_1d(d.mean(axis=1))                   # 가로 선 → 세로 간격
+    px_x, qx = _pitch_1d(_strips(d, 0))                    # 세로 선 → 가로 간격
+    px_y, qy = _pitch_1d(_strips(d, 1))                    # 가로 선 → 세로 간격
     vals = [v for v in (px_x, px_y) if np.isfinite(v)]
     if not vals:
         return dict(ok=False, px=np.nan, px_x=px_x, px_y=px_y, quality=0.0)
@@ -593,12 +622,15 @@ def run_case(k, cs):
                  "위의 '직접 고치기'에서 한 칸의 픽셀 수를 넣어 주세요.")
         return None
     kcm = cell_cm / px                                   # 1 px = kcm cm
-    roi = None if (use_full or proi is None) else proi
+    roi = None
+    if not use_full and proi is not None:                # 레이저를 찾는 영역 = 종이 + 사방 25% 여유
+        mx_, my_ = int(0.25 * (proi[2] - proi[0])), int(0.25 * (proi[3] - proi[1]))
+        roi = (max(0, proi[0] - mx_), max(0, proi[1] - my_), min(W, proi[2] + mx_), min(Hh, proi[3] + my_))
     st.markdown(f"**모눈 자동 인식:** 한 칸 = **{px:.1f} px** "
                 f"(가로 {gp['px_x']:.1f}, 세로 {gp['px_y']:.1f}) → 1 px = {kcm * 10:.3f} mm")
-    if roi is not None:
-        st.caption(f"인식한 종이 크기 약 {(roi[2] - roi[0]) * kcm:.1f} × {(roi[3] - roi[1]) * kcm:.1f} cm "
-                   "(A4는 21 × 29.7 cm). 크게 다르면 모눈 간격을 잘못 잡은 것입니다.")
+    if proi is not None:
+        st.caption(f"인식한 종이 크기 약 {(proi[2] - proi[0]) * kcm:.1f} × {(proi[3] - proi[1]) * kcm:.1f} cm. "
+                   "실제 종이를 자로 잰 크기(화면에 다 보이는 경우)와 크게 다르면 모눈 간격이나 1번의 모눈 크기가 틀린 것입니다.")
     if px_manual <= 0 and not gp["ok"]:
         st.warning("모눈 간격 인식이 불확실합니다(가로·세로 간격이 다르거나 선이 흐림). "
                    "카메라가 정면이 아니거나 초점이 맞지 않았을 수 있습니다. 아래 그림의 노란 눈금이 모눈 선과 맞는지 확인하세요.")
@@ -612,8 +644,11 @@ def run_case(k, cs):
     if roi is not None:
         ax.add_patch(plt.Rectangle((roi[0] * ps, roi[1] * ps), (roi[2] - roi[0]) * ps, (roi[3] - roi[1]) * ps,
                                    fill=False, ls="--", color="#eb6834", lw=1.5))
-    cx = ((roi[0] + roi[2]) / 2 if roi else W / 2) * ps
-    cy = ((roi[1] + roi[3]) / 2 if roi else Hh / 2) * ps
+    if proi is not None:
+        ax.add_patch(plt.Rectangle((proi[0] * ps, proi[1] * ps), (proi[2] - proi[0]) * ps, (proi[3] - proi[1]) * ps,
+                                   fill=False, color="#2a78d6", lw=1.5))
+    cx = ((proi[0] + proi[2]) / 2 if proi else W / 2) * ps
+    cy = ((proi[1] + proi[3]) / 2 if proi else Hh / 2) * ps
     pp = px * ps
     for i in range(-5, 6):                               # 인식한 간격으로 그린 확인용 눈금
         ax.plot([cx + i * pp] * 2, [cy - 5 * pp, cy + 5 * pp], color="yellow", lw=0.8)
@@ -623,8 +658,11 @@ def run_case(k, cs):
     ax.axis("off")
     st.pyplot(fig)
     plt.close(fig)
-    st.caption("주황 점선: 인식한 종이(레이저를 찾는 영역) · 노란 눈금: 인식한 모눈 간격(10칸) · 빨간 +: 이 장면의 레이저 점. "
+    st.caption("파란 선: 인식한 종이 · 주황 점선: 레이저를 찾는 영역 · 노란 눈금: 인식한 모눈 간격(10칸) · 빨간 +: 이 장면의 레이저 점. "
                "노란 눈금 간격이 모눈 한 칸과 같으면 정상입니다(위치는 어긋나도 됩니다).")
+    if dot0 is not None and proi is not None and not (proi[0] <= dot0[0] <= proi[2] and proi[1] <= dot0[1] <= proi[3]):
+        st.warning("레이저 점이 종이 밖에 찍혀 있습니다. 벽과 종이가 같은 평면이면 계산은 되지만, "
+                   "점이 종이 안에 오도록 종이 위치를 옮겨 찍는 것을 권합니다.")
     if dot0 is None:
         st.warning("영상 중간 장면에서 레이저 점을 찾지 못했습니다. "
                    "분석이 실패하면 검출 감도를 낮추거나 '화면 전체에서 찾기'를 켜 보세요.")
