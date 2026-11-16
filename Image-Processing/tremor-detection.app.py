@@ -32,6 +32,32 @@ def read_frames_info(path):
     return dict(fps=fps, n=n, w=w, h=h, first=cv2.cvtColor(first, cv2.COLOR_BGR2RGB))
 
 
+def read_frame_at(path, frac):
+    """영상 길이의 frac(0~1) 지점 프레임 한 장 (RGB). 실패하면 None."""
+    cap = cv2.VideoCapture(path)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if n > 1:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frac * (n - 1)))
+    ok, fr = cap.read()
+    cap.release()
+    return cv2.cvtColor(fr, cv2.COLOR_BGR2RGB) if ok else None
+
+
+def grid_from_frames(frames):
+    """여러 장에서 모눈 간격을 재고 중앙값을 쓴다 (손·팔이 종이를 가린 장면에 강하게)."""
+    rois, pts = [], []
+    for fr in frames:
+        roi = paper_roi(fr)
+        g = grid_pitch(fr, roi)
+        if np.isfinite(g["px"]):
+            rois.append(roi)
+            pts.append(g)
+    if not pts:
+        return None, dict(ok=False, px=np.nan, px_x=np.nan, px_y=np.nan, quality=0.0)
+    i = int(np.argsort([g["px"] for g in pts])[len(pts) // 2])    # 중앙값에 해당하는 장
+    return rois[i], pts[i]
+
+
 def preview(rgb, max_w=1280):
     """화면 표시용 축소본과 배율 (4K 그림을 그대로 그리면 메모리를 많이 씀)."""
     s = min(1.0, max_w / rgb.shape[1])
@@ -382,7 +408,7 @@ def grid_pitch(rgb, roi=None):
     return dict(ok=bool(same and q > 0.15), px=px, px_x=px_x, px_y=px_y, quality=q)
 
 
-core = types.SimpleNamespace(detect_tremor=detect_tremor, preview=preview, paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
+core = types.SimpleNamespace(read_frame_at=read_frame_at, grid_from_frames=grid_from_frames, detect_tremor=detect_tremor, preview=preview, paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
 # ====================== 화면 부분 ======================
 import gc
 # 화면에 보여야 할 것 (이용자 입력)
@@ -553,8 +579,11 @@ def run_case(k, cs):
 
     # 모눈 간격 자동 인식 (정면 촬영 가정)
     W, Hh = info["w"], info["h"]
-    proi = core.paper_roi(info["first"])
-    gp = core.grid_pitch(info["first"], proi)
+    # 측정 중 장면 3장(영상의 40%, 55%, 70% 지점)에서 모눈을 재고 가운데 값을 씀.
+    # 첫 화면은 준비 동작 중이라 팔이 종이를 가리거나 점이 없을 수 있음.
+    frames = [f for f in (core.read_frame_at(path, q) for q in (0.40, 0.55, 0.70)) if f is not None]
+    shot = frames[1] if len(frames) > 1 else (frames[0] if frames else info["first"])   # 확인 그림용 (영상 중간)
+    proi, gp = core.grid_from_frames(frames or [info["first"]])
     with st.expander("자동 인식이 틀렸을 때 직접 고치기"):
         px_manual = st.number_input("영상에서 모눈 한 칸의 픽셀 수 (0 = 자동)", 0.0, 1000.0, 0.0, 0.5, key=k + "pxm")
         use_full = st.checkbox("종이 영역을 쓰지 않고 화면 전체에서 레이저 찾기", key=k + "full")
@@ -574,9 +603,10 @@ def run_case(k, cs):
         st.warning("모눈 간격 인식이 불확실합니다(가로·세로 간격이 다르거나 선이 흐림). "
                    "카메라가 정면이 아니거나 초점이 맞지 않았을 수 있습니다. 아래 그림의 노란 눈금이 모눈 선과 맞는지 확인하세요.")
 
-    first_bgr = info["first"][..., ::-1].copy()
+    first_bgr = shot[..., ::-1].copy()
     dot0 = core.detect_dot(first_bgr, roi, min_score)
-    pv, ps = core.preview(info["first"])                 # 화면 표시용 축소본 (ps = 축소 배율)
+    del frames
+    pv, ps = core.preview(shot)                 # 화면 표시용 축소본 (ps = 축소 배율)
     fig, ax = plt.subplots(figsize=(9, 9 * Hh / W), dpi=80)
     ax.imshow(pv)
     if roi is not None:
@@ -593,10 +623,10 @@ def run_case(k, cs):
     ax.axis("off")
     st.pyplot(fig)
     plt.close(fig)
-    st.caption("주황 점선: 인식한 종이(레이저를 찾는 영역) · 노란 눈금: 인식한 모눈 간격(10칸) · 빨간 +: 첫 화면의 레이저 점. "
+    st.caption("주황 점선: 인식한 종이(레이저를 찾는 영역) · 노란 눈금: 인식한 모눈 간격(10칸) · 빨간 +: 이 장면의 레이저 점. "
                "노란 눈금 간격이 모눈 한 칸과 같으면 정상입니다(위치는 어긋나도 됩니다).")
     if dot0 is None:
-        st.warning("첫 화면에서 레이저 점을 찾지 못했습니다. 준비 중이라 점이 없었다면 괜찮습니다. "
+        st.warning("영상 중간 장면에서 레이저 점을 찾지 못했습니다. "
                    "분석이 실패하면 검출 감도를 낮추거나 '화면 전체에서 찾기'를 켜 보세요.")
 
     run_key = (vkey, roi, min_score, round(float(px), 3))
