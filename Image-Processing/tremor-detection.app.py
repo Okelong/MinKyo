@@ -140,13 +140,64 @@ def to_wall(H, x, y):
 
 
 # ---------------------------------------------------------------- 분석
+def auto_window(t, xw, yw, win_s=10.0, min_s=3.0, margin_s=0.5, v_thr=None):
+    """준비 동작(팔 뻗기, 자리 잡기, 점이 화면 밖으로 나감)을 빼고
+    레이저 점이 한자리에 안정적으로 머무는 구간을 자동으로 찾는다.
+
+    1) 점을 찾은 프레임만 쓰고, 일정한 시간 간격으로 맞춘다.
+    2) 1 Hz 이하의 느린 움직임(자세 이동)만 남겨 그 속도(cm/s)를 구한다.
+       떨림(2 Hz 이상)은 이 속도에 거의 들어가지 않는다.
+    3) 느린 속도가 기준보다 작고 점이 보이는 시간이 가장 길게 이어진 구간을 고른다.
+    4) 구간 앞뒤로 margin_s만큼 여유를 두고, 그 안에서 win_s초를 쓴다.
+    """
+    fs = round(1 / np.median(np.diff(t)))
+    tu = np.arange(t[0], t[-1], 1 / fs)
+    seen = ~np.isnan(xw)
+    if seen.sum() < 10:
+        raise ValueError("레이저 점을 거의 찾지 못했습니다. 분석 영역과 검출 감도를 확인하세요.")
+    vis = np.interp(tu, t, seen.astype(float)) > 0.99            # 점이 보이는 시점
+    x = np.interp(tu, t[seen], xw[seen])
+    y = np.interp(tu, t[seen], yw[seen])
+    b, a = butter(2, 1.0, btype="low", fs=fs)
+    xs, ys = filtfilt(b, a, x), filtfilt(b, a, y)
+    speed = np.hypot(np.gradient(xs), np.gradient(ys)) * fs         # 느린 움직임 속도 (cm/s)
+    if v_thr is None:
+        v_thr = max(1.0, 3 * np.median(speed[vis]))                 # 자세를 잡은 뒤의 흔들림보다 충분히 큰 값
+    ok = vis & (speed < v_thr)
+    # 가장 길게 이어진 안정 구간 찾기
+    best, cur, start, best_start = 0, 0, 0, 0
+    for i, v in enumerate(ok):
+        if v:
+            if cur == 0:
+                start = i
+            cur += 1
+            if cur > best:
+                best, best_start = cur, start
+        else:
+            cur = 0
+    t_s = tu[best_start] + margin_s
+    t_e = tu[best_start + best - 1] - margin_s if best else t_s
+    info = dict(speed_t=tu, speed=speed, v_thr=float(v_thr), stable=ok,
+                stable_start=float(tu[best_start]) if best else np.nan,
+                stable_end=float(tu[best_start + best - 1]) if best else np.nan)
+    if t_e - t_s < min_s:
+        raise ValueError(f"점이 안정적으로 머문 구간이 {max(t_e - t_s, 0):.1f}초뿐입니다. "
+                         f"자세를 잡은 뒤 {min_s:.0f}초 이상 움직이지 않도록 다시 찍어 주세요.")
+    t1 = min(t_s + win_s, t_e)
+    return float(t_s), float(t1), info
+
+
 def analyze(t, xw, yw, skip_s=3.0, win_s=10.0, fs_out=None,
-            D_cm=None, hL_cm=None, hB_cm=None, target=None):
-    """벽 좌표(cm) 시계열로 떨림을 분석한다."""
+            D_cm=None, hL_cm=None, hB_cm=None, target=None, window=None, h_dot_cm=None):
+    """벽 좌표(cm) 시계열로 떨림을 분석한다.
+    window=(시작, 끝)을 주면 그 구간을, 없으면 앞 skip_s초를 뺀 구간을 쓴다."""
     res = {}
     fs = fs_out or round(1 / np.median(np.diff(t)))
-    t0 = t[0] + skip_s
-    t1 = min(t0 + win_s, t[-1])
+    if window is not None:
+        t0, t1 = window
+    else:
+        t0 = t[0] + skip_s
+        t1 = min(t0 + win_s, t[-1])
     if t1 - t0 < 2:
         raise ValueError("분석할 구간이 2초보다 짧습니다. 영상 길이와 제외 시간을 확인하세요.")
     tu = np.arange(t0, t1, 1 / fs)                       # 일정한 시간 간격으로 다시 맞춤
@@ -197,7 +248,10 @@ def analyze(t, xw, yw, skip_s=3.0, win_s=10.0, fs_out=None,
     # 빛의 기울기 보정
     if D_cm:
         theta = 0.0
-        if hL_cm is not None and hB_cm is not None:
+        if hL_cm is not None and h_dot_cm is not None:
+            r = hL_cm - h_dot_cm                         # 레이저 높이 - 벽의 점 높이 (줄자로 잰 값)
+            theta = float(np.arctan(abs(r) / D_cm))
+        elif hL_cm is not None and hB_cm is not None:
             r = hL_cm - (hB_cm + my)                     # 레이저 높이 - 점 높이
             theta = float(np.arctan(abs(r) / D_cm))
         res["theta_deg"] = float(np.degrees(theta))
@@ -220,15 +274,94 @@ def judge(res, cond, rel_thr=0.3):
     return has, msgs
 
 
-core = types.SimpleNamespace(BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
+# ---------------------------------------------------------------- 모눈 자동 인식
+def paper_roi(rgb):
+    """첫 화면에서 가장 큰 밝은 영역(종이)의 사각형 (x0, y0, x1, y1). 못 찾으면 None."""
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = g.shape
+    sc = 800.0 / max(h, w)
+    sm = cv2.resize(g, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
+    sm = cv2.GaussianBlur(sm, (5, 5), 0)
+    _, bw = cv2.threshold(sm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))   # 모눈 선 메우기
+    n, lab, st_, _ = cv2.connectedComponentsWithStats(bw, 8)
+    if n <= 1:
+        return None
+    k = 1 + np.argmax(st_[1:, cv2.CC_STAT_AREA])
+    if st_[k, cv2.CC_STAT_AREA] < 0.05 * sm.size:
+        return None
+    x, y, ww, hh = st_[k, :4]
+    return (int(x / sc), int(y / sc), int((x + ww) / sc), int((y + hh) / sc))
+
+
+def _pitch_1d(p):
+    """밝기 단면에서 반복 간격(px)을 자기상관으로 찾는다."""
+    p = np.asarray(p, float)
+    n = len(p)
+    if n < 40:
+        return np.nan, 0.0
+    win = max(5, n // 8) | 1
+    p = p - np.convolve(p, np.ones(win) / win, mode="same")
+    p = p[win:-win]
+    p = p - p.mean()
+    m = len(p)
+    f = np.fft.rfft(p, 2 * m)
+    ac = np.fft.irfft(f * np.conj(f))[:m]
+    if ac[0] <= 0:
+        return np.nan, 0.0
+    ac = ac / ac[0]
+    lo, hi = 4, m // 3
+    pk, pr = find_peaks(ac[lo:hi], prominence=0.05)
+    if len(pk) == 0:
+        return np.nan, 0.0
+    pk = pk + lo
+    hts = ac[pk]
+    first = pk[np.argmax(hts >= 0.3 * hts.max())]     # 충분히 뚜렷한 첫 번째 반복
+    # 여러 배수 위치의 봉우리로 간격을 정밀하게
+    lags, mult = [], []
+    for j in range(1, 30):
+        c = j * first
+        if c + 3 >= hi:
+            break
+        a, b = int(c - 0.25 * first), int(c + 0.25 * first) + 1
+        q = a + int(np.argmax(ac[a:b]))
+        if 0 < q < m - 1:                                   # 포물선 보간
+            d = ac[q - 1] - 2 * ac[q] + ac[q + 1]
+            q = q + (0.5 * (ac[q - 1] - ac[q + 1]) / d if d != 0 else 0)
+        lags.append(q)
+        mult.append(j)
+    pitch = float(np.polyfit(mult, lags, 1)[0]) if len(lags) >= 2 else float(first)
+    return pitch, float(ac[first])
+
+
+def grid_pitch(rgb, roi=None):
+    """모눈 한 칸이 영상에서 몇 px인지 찾는다. 반환: dict(px, px_x, px_y, quality, ok)."""
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(float)
+    if roi is not None:
+        x0, y0, x1, y1 = roi
+        dx, dy = int(0.12 * (x1 - x0)), int(0.12 * (y1 - y0))
+        g = g[y0 + dy:y1 - dy, x0 + dx:x1 - dx]
+    d = 255.0 - g                                          # 선이 어두우므로 어두운 정도
+    px_x, qx = _pitch_1d(d.mean(axis=0))                   # 세로 선 → 가로 간격
+    px_y, qy = _pitch_1d(d.mean(axis=1))                   # 가로 선 → 세로 간격
+    vals = [v for v in (px_x, px_y) if np.isfinite(v)]
+    if not vals:
+        return dict(ok=False, px=np.nan, px_x=px_x, px_y=px_y, quality=0.0)
+    px = float(np.mean(vals))
+    same = len(vals) == 2 and abs(px_x - px_y) / px < 0.15
+    q = float(min(qx, qy)) if len(vals) == 2 else float(max(qx, qy))
+    return dict(ok=bool(same and q > 0.15), px=px, px_x=px_x, px_y=px_y, quality=q)
+
+
+core = types.SimpleNamespace(paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
 # ====================== 화면 부분 ======================
 # 화면에 보여야 할 것 (이용자 입력)
 # 1. 측정 정보: 몇 차시인지, 사용한 손, 사용한 모눈 크기, 벽까지 거리
 # 2. 측정 당시 상태
 # 3. 카메라 설정 상태
 # 4. 영상 2개 업로드 칸: 이완(안정시), 긴장(자세 유지)
-#    + 각각 바닥에서 레이저까지 높이 (각도 계산용)
-# 이후: 모눈 위치 지정 → 분석 → 결과 → 두 조건 비교와 기록
+#    + 이완 상태만 레이저 높이와 벽의 점 높이 (각도 보정용)
+# 이후: 모눈 간격 자동 인식 → 분석 → 결과 → 두 조건 비교와 기록
 # 진폭은 진단 기준으로 쓰지 않고, 파킨슨병·본태성 떨림 판정은 하지 않는다.
 
 st.set_page_config(page_title="레이저 떨림 측정", layout="wide")
@@ -244,12 +377,15 @@ with st.expander("촬영 방법 (처음이라면 꼭 읽어 주세요)"):
         "4. 레이저 포인터는 **손등 가운데**에 테이프로 붙이고 켜짐 상태로 고정합니다.\n"
         "5. **이완:** 팔꿈치부터 손목까지 받침대에 고정하고 손목은 힘을 빼 늘어뜨립니다.\n"
         "6. **긴장:** 팔을 앞으로 뻗어 모눈종이의 표적 점을 가리킵니다.\n"
-        "7. 각 조건을 **13초 정도** 찍습니다. 앞 3초는 자세를 잡는 시간이라 분석에서 뺍니다.\n"
-        "8. 레이저를 사람의 눈에 비추지 마세요.")
+        "7. 카메라는 모눈종이와 **정면으로 마주 보게** 두고, 모눈이 화면에 크게 나오게 찍습니다. 모눈 간격은 프로그램이 자동으로 찾습니다.\n"
+        "8. 각 조건을 **13초 정도** 찍습니다. 앞 3초는 자세를 잡는 시간이라 분석에서 뺍니다.\n"
+        "9. 레이저를 사람의 눈에 비추지 마세요.")
 
 with st.sidebar.expander("고급 설정"):
-    skip_s = st.number_input("앞부분 제외 (초)", 0.0, 10.0, 3.0, 0.5)
-    win_s = st.number_input("분석 시간 (초)", 2.0, 60.0, 10.0, 1.0)
+    win_mode = st.radio("분석 구간", ["자동으로 찾기", "앞부분 직접 제외"],
+                        help="자동: 점이 한자리에 안정적으로 머문 구간만 골라 씁니다.")
+    skip_s = st.number_input("앞부분 제외 (초, 직접 제외일 때)", 0.0, 10.0, 3.0, 0.5)
+    win_s = st.number_input("최대 분석 시간 (초)", 2.0, 60.0, 10.0, 1.0)
     min_score = st.slider("레이저 검출 감도 (낮을수록 예민)", 20, 150, 60)
     rel_thr = st.slider("떨림 판단 기준 (상대 세기)", 0.1, 0.8, 0.3, 0.05)
 
@@ -296,26 +432,24 @@ st.caption("영상을 올리면 실제 해상도와 프레임을 파일에서 �
 
 # ------------------------------------------------------------------ 4. 영상 올리기
 st.header("4. 영상 올리기")
-st.caption("각도 계산을 위해 바닥에서 레이저까지의 높이와 바닥에서 모눈 사각형 아래 선까지의 높이를 넣어 주세요. "
-           "아래 선 높이를 모르면 '모름'을 체크하세요. 이때는 빛의 기울기 보정 없이 계산합니다.")
 left, right = st.columns(2)
 cases = {}
 with left:
     st.subheader("이완 상태 (안정시)")
     up = st.file_uploader("이완 상태 영상", type=["mp4", "mov", "m4v", "avi"], key="rest_up")
-    hL = st.number_input("바닥 → 레이저 높이 (cm)", 0.0, 300.0, 90.0, 0.5, key="rest_hL")
-    hB_unknown = st.checkbox("모눈 사각형 아래 선 높이를 모름", key="rest_hBno",
+    st.caption("이완 상태는 손목이 늘어져 빛이 비스듬히 내려가므로, 벽에 찍힌 점이 길게 늘어난 만큼 각도를 보정합니다.")
+    hL = st.number_input("바닥 → 레이저(손등) 높이 (cm)", 0.0, 300.0, 90.0, 0.5, key="rest_hL")
+    hd_unknown = st.checkbox("벽에 찍힌 레이저 점 높이를 모름", key="rest_hdno",
                              help="모르면 빛의 기울기 보정을 하지 않습니다. 주파수에는 영향이 없습니다.")
-    hB = None if hB_unknown else st.number_input("바닥 → 모눈 사각형 아래 선 높이 (cm)", 0.0, 300.0, 70.0, 0.5, key="rest_hB")
-    cases["rest_"] = dict(cond="이완", up=up, hL=hL, hB=hB, target=None)
+    h_dot = None if hd_unknown else st.number_input(
+        "바닥 → 벽에 찍힌 레이저 점 높이 (cm)", 0.0, 300.0, 70.0, 0.5, key="rest_hd",
+        help="자세를 잡은 뒤 점이 머무는 위치를 줄자로 바닥부터 잽니다.")
+    cases["rest_"] = dict(cond="이완", up=up, hL=hL, h_dot=h_dot, posture=False)
 with right:
     st.subheader("긴장 상태 (자세 유지)")
     up = st.file_uploader("긴장 상태 영상", type=["mp4", "mov", "m4v", "avi"], key="post_up")
-    hL = st.number_input("바닥 → 레이저 높이 (cm)", 0.0, 300.0, 120.0, 0.5, key="post_hL")
-    hB_unknown = st.checkbox("모눈 사각형 아래 선 높이를 모름", key="post_hBno",
-                             help="모르면 빛의 기울기 보정을 하지 않습니다. 주파수에는 영향이 없습니다.")
-    hB = None if hB_unknown else st.number_input("바닥 → 모눈 사각형 아래 선 높이 (cm)", 0.0, 300.0, 115.0, 0.5, key="post_hB")
-    cases["post_"] = dict(cond="긴장", up=up, hL=hL, hB=hB, target="ask")
+    st.caption("긴장 상태는 팔을 뻗어 표적을 정면으로 가리키므로 빛이 거의 수평이라 각도 보정을 하지 않습니다.")
+    cases["post_"] = dict(cond="긴장", up=up, hL=None, h_dot=None, posture=True)
 
 
 @st.cache_data(show_spinner="레이저 점을 찾는 중입니다. 영상 길이에 따라 수십 초 걸릴 수 있습니다.")
@@ -365,7 +499,7 @@ def camera_auto(path, info):
 
 def run_case(k, cs):
     cond, up = cs["cond"], cs["up"]
-    posture = cs["target"] == "ask"
+    posture = cs["posture"]
     if up is None:
         st.info(f"4번에서 {cond} 상태 영상을 올리면 여기서 분석할 수 있습니다.")
         return None
@@ -373,78 +507,94 @@ def run_case(k, cs):
     info = core.read_frames_info(path)
     st.markdown("**카메라 설정 (파일에서 자동으로 읽은 값)**")
     cam = camera_auto(path, info)
-    if cam["dur"] < skip_s + 2:
+    if cam["dur"] < (4 if win_mode == "자동으로 찾기" else skip_s + 2):
         st.error("영상이 너무 짧습니다. 앞부분 제외 시간보다 2초 이상 길게 찍어 주세요.")
         return None
 
-    st.markdown("**모눈종이 위치 지정 (비스듬한 촬영 보정)**")
-    a, b = st.columns(2)
-    nx = a.number_input("사각형 가로 칸 수", 1, 100, 10, key=k + "nx")
-    ny = b.number_input("사각형 세로 칸 수", 1, 100, 10, key=k + "ny")
-    st.caption(f"첫 화면에서 가로 {nx}칸 × 세로 {ny}칸 사각형의 네 모서리 좌표(픽셀)를 그림의 눈금을 보고 입력하세요. "
-               "사각형 아래 선은 4번에서 높이를 잰 선이어야 합니다.")
+    # 모눈 간격 자동 인식 (정면 촬영 가정)
     W, Hh = info["w"], info["h"]
-    dflt = [(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)]
-    corners = []
-    cols = st.columns(4)
-    for i, (nm, (fx, fy)) in enumerate(zip(["왼쪽 위", "오른쪽 위", "오른쪽 아래", "왼쪽 아래"], dflt)):
-        with cols[i]:
-            st.markdown(f"**{nm}**")
-            x = st.number_input("x", 0, W, int(W * fx), key=f"{k}cx{i}")
-            y = st.number_input("y", 0, Hh, int(Hh * fy), key=f"{k}cy{i}")
-            corners.append((x, y))
-    xs_c = [p[0] for p in corners]
-    ys_c = [p[1] for p in corners]
-    pad = 0.15 * max(max(xs_c) - min(xs_c), max(ys_c) - min(ys_c))
-    roi = (int(max(0, min(xs_c) - pad)), int(max(0, min(ys_c) - pad)),
-           int(min(W, max(xs_c) + pad)), int(min(Hh, max(ys_c) + pad)))
-
-    target = None
-    if posture:
-        st.markdown("**표적 점 위치 (사각형 왼쪽 아래 기준, cm)**")
-        t1, t2 = st.columns(2)
-        target = (t1.number_input("표적 x (cm)", 0.0, 500.0, float(nx * cell_cm / 2), key=k + "tx"),
-                  t2.number_input("표적 y (cm)", 0.0, 500.0, float(ny * cell_cm / 2), key=k + "ty"))
+    proi = core.paper_roi(info["first"])
+    gp = core.grid_pitch(info["first"], proi)
+    with st.expander("자동 인식이 틀렸을 때 직접 고치기"):
+        px_manual = st.number_input("영상에서 모눈 한 칸의 픽셀 수 (0 = 자동)", 0.0, 1000.0, 0.0, 0.5, key=k + "pxm")
+        use_full = st.checkbox("종이 영역을 쓰지 않고 화면 전체에서 레이저 찾기", key=k + "full")
+    px = px_manual if px_manual > 0 else gp["px"]
+    if not np.isfinite(px) or px <= 0:
+        st.error("모눈 간격을 찾지 못했습니다. 모눈종이가 화면에 크게, 정면으로 나오게 다시 찍거나 "
+                 "위의 '직접 고치기'에서 한 칸의 픽셀 수를 넣어 주세요.")
+        return None
+    kcm = cell_cm / px                                   # 1 px = kcm cm
+    roi = None if (use_full or proi is None) else proi
+    st.markdown(f"**모눈 자동 인식:** 한 칸 = **{px:.1f} px** "
+                f"(가로 {gp['px_x']:.1f}, 세로 {gp['px_y']:.1f}) → 1 px = {kcm * 10:.3f} mm")
+    if roi is not None:
+        st.caption(f"인식한 종이 크기 약 {(roi[2] - roi[0]) * kcm:.1f} × {(roi[3] - roi[1]) * kcm:.1f} cm "
+                   "(A4는 21 × 29.7 cm). 크게 다르면 모눈 간격을 잘못 잡은 것입니다.")
+    if px_manual <= 0 and not gp["ok"]:
+        st.warning("모눈 간격 인식이 불확실합니다(가로·세로 간격이 다르거나 선이 흐림). "
+                   "카메라가 정면이 아니거나 초점이 맞지 않았을 수 있습니다. 아래 그림의 노란 눈금이 모눈 선과 맞는지 확인하세요.")
 
     first_bgr = info["first"][..., ::-1].copy()
     dot0 = core.detect_dot(first_bgr, roi, min_score)
     fig, ax = plt.subplots(figsize=(9, 9 * Hh / W))
     ax.imshow(info["first"])
-    poly = corners + [corners[0]]
-    ax.plot([p[0] for p in poly], [p[1] for p in poly], "-", color="#2a78d6", lw=2)
-    for (x, y), nm in zip(corners, ["TL", "TR", "BR", "BL"]):
-        ax.plot(x, y, "o", color="#2a78d6")
-        ax.annotate(nm, (x, y), color="#2a78d6", xytext=(5, 5), textcoords="offset points")
-    ax.add_patch(plt.Rectangle((roi[0], roi[1]), roi[2] - roi[0], roi[3] - roi[1],
-                               fill=False, ls="--", color="#eb6834"))
+    if roi is not None:
+        ax.add_patch(plt.Rectangle((roi[0], roi[1]), roi[2] - roi[0], roi[3] - roi[1],
+                                   fill=False, ls="--", color="#eb6834", lw=1.5))
+    cx = (roi[0] + roi[2]) / 2 if roi else W / 2
+    cy = (roi[1] + roi[3]) / 2 if roi else Hh / 2
+    for i in range(-5, 6):                               # 인식한 간격으로 그린 확인용 눈금
+        ax.plot([cx + i * px] * 2, [cy - 5 * px, cy + 5 * px], color="yellow", lw=0.8)
+        ax.plot([cx - 5 * px, cx + 5 * px], [cy + i * px] * 2, color="yellow", lw=0.8)
     if dot0:
-        ax.plot(*dot0, "+", color="yellow", ms=18, mew=2)
-    ax.set_xticks(np.arange(0, W + 1, 100))
-    ax.set_yticks(np.arange(0, Hh + 1, 100))
-    ax.tick_params(labelsize=7)
-    ax.grid(alpha=0.25)
+        ax.plot(*dot0, "+", color="red", ms=18, mew=2)
+    ax.axis("off")
     st.pyplot(fig)
     plt.close(fig)
-    st.caption("파란 선: 입력한 사각형 · 주황 점선: 레이저를 찾는 영역 · 노란 +: 첫 화면에서 찾은 레이저 점")
+    st.caption("주황 점선: 인식한 종이(레이저를 찾는 영역) · 노란 눈금: 인식한 모눈 간격(10칸) · 빨간 +: 첫 화면의 레이저 점. "
+               "노란 눈금 간격이 모눈 한 칸과 같으면 정상입니다(위치는 어긋나도 됩니다).")
     if dot0 is None:
-        st.warning("첫 화면에서 레이저 점을 찾지 못했습니다. 사각형 위치나 검출 감도를 확인하세요.")
+        st.warning("첫 화면에서 레이저 점을 찾지 못했습니다. 준비 중이라 점이 없었다면 괜찮습니다. "
+                   "분석이 실패하면 검출 감도를 낮추거나 '화면 전체에서 찾기'를 켜 보세요.")
 
-    run_key = (vkey, roi, min_score)
+    run_key = (vkey, roi, min_score, round(float(px), 3))
     if st.button(f"{cond} 상태 분석 시작", type="primary", key=k + "go"):
         st.session_state[k + "ran"] = run_key
     if st.session_state.get(k + "ran") != run_key:
         return None
     t, xp, yp, fps = track_cached(path, roi, min_score)
-    Hm = core.homography(corners, nx * cell_cm, ny * cell_cm)
-    xw, yw = core.to_wall(Hm, xp, yp)
+    xw, yw = xp * kcm, (Hh - yp) * kcm                  # 화면 픽셀 → 벽 cm (위쪽이 +y)
     try:
-        r = core.analyze(t, xw, yw, skip_s, win_s, D_cm=D_cm, hL_cm=cs["hL"], hB_cm=cs["hB"], target=target)
+        aw = None
+        if win_mode == "자동으로 찾기":
+            t_s, t_e, aw = core.auto_window(t, xw, yw, win_s)
+            window = (t_s, t_e)
+        else:
+            window = None
+        r = core.analyze(t, xw, yw, skip_s, win_s, D_cm=D_cm, hL_cm=cs["hL"], h_dot_cm=cs["h_dot"],
+                         window=window)
     except ValueError as e:
         st.error(str(e))
         return None
     has = r["rel_power"] >= rel_thr
 
     st.markdown(f"### {cond} 상태 결과")
+    used0, used1 = r["t"][0] - t[0], r["t"][-1] - t[0]
+    if aw is not None:
+        st.info(f"준비 동작을 빼고 점이 안정적으로 머문 **{used0:.1f}초 ~ {used1:.1f}초** "
+                f"({used1 - used0:.1f}초)를 자동으로 골라 분석했습니다.")
+        fig, ax = plt.subplots(figsize=(9, 2.2))
+        ax.plot(aw["speed_t"] - t[0], aw["speed"], color="#2a78d6", lw=1)
+        ax.axhline(aw["v_thr"], color="#eb6834", ls="--", lw=1)
+        ax.axvspan(used0, used1, color="#e5f4e4")
+        ax.set_ylim(0, max(3 * aw["v_thr"], 1))
+        ax.set_xlabel("time in video (s)")
+        ax.set_ylabel("slow speed (cm/s)")
+        ax.set_title("Green: segment used for analysis  |  dashed: stability threshold", fontsize=9)
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.info(f"영상의 {used0:.1f}초 ~ {used1:.1f}초를 분석했습니다.")
     if has:
         st.warning(f"떨림이 감지되었습니다. 초당 약 {r['peak_hz']:.1f}회({r['peak_hz']:.1f} Hz) 떨립니다.")
     else:
@@ -454,23 +604,21 @@ def run_case(k, cs):
     m[1].metric("주파수", f"{r['peak_hz']:.2f} Hz",
                 f"피크 간격 {r['interval_hz']:.2f} Hz" if np.isfinite(r["interval_hz"]) else None, delta_color="off")
     m[2].metric("벽에서 진폭", f"{r['amp_mm']:.2f} mm")
-    no_corr = cs["hB"] is None
+    no_corr = cs["h_dot"] is None
     m[3].metric("겉보기 각진폭", f"{r['ang_amp_deg']:.3f}°",
-                "각도 보정 안 됨" if no_corr else f"빛의 기울기 θ {r['theta_deg']:.1f}°", delta_color="off")
+                ("긴장 상태는 보정 안 함" if posture else "각도 보정 안 됨") if no_corr else f"빛의 기울기 θ {r['theta_deg']:.1f}°", delta_color="off")
     if posture:
-        st.metric("표적 점에서 평균 이탈 거리", f"{r['target_dev_cm']:.2f} cm")
+        dev = float(np.mean(np.hypot(r["x_raw"] - r["mean_pos"][0], r["y_raw"] - r["mean_pos"][1])))
+        st.metric("점이 평균 위치에서 벗어난 거리 (흔들림 + 느린 흔들림)", f"{dev:.2f} cm")
 
     warns = []
     if r["missing_ratio"] > 0.1:
         warns.append(f"분석 구간의 {r['missing_ratio'] * 100:.0f}%에서 레이저 점을 찾지 못했습니다.")
-    if no_corr:
-        warns.append("모눈 사각형 아래 선 높이를 몰라 빛의 기울기 보정을 하지 않았습니다. "
+    if no_corr and not posture:
+        warns.append("벽에 찍힌 점 높이를 몰라 빛의 기울기 보정을 하지 않았습니다. "
                      "손이 많이 처졌다면 각진폭이 실제보다 크게 나올 수 있습니다. 주파수에는 영향이 없습니다.")
     if r["theta_deg"] > 25:
         warns.append("빛의 기울기가 25°보다 큽니다. 진폭 보정 오차가 커질 수 있습니다.")
-    mx, my = r["mean_pos"]
-    if not (0 <= mx <= nx * cell_cm and 0 <= my <= ny * cell_cm):
-        warns.append("레이저 점이 지정한 사각형 밖에 있습니다. 보정이 부정확할 수 있습니다.")
     for w_ in warns:
         st.warning(w_)
 
@@ -478,8 +626,6 @@ def run_case(k, cs):
     with g[0]:
         fig, ax = plt.subplots(figsize=(4, 4))
         ax.plot(r["x_raw"], r["y_raw"], lw=0.8, color="#2a78d6")
-        if target is not None:
-            ax.plot(*target, "x", color="#eb6834", ms=10, mew=2)
         ax.set_aspect("equal")
         ax.set_xlabel("x (cm)")
         ax.set_ylabel("y (cm)")
@@ -516,9 +662,11 @@ def run_case(k, cs):
             "주파수(Hz)": round(r["peak_hz"], 2), "피크간격(Hz)": round(r["interval_hz"], 2),
             "상대세기": round(r["rel_power"], 2), "진폭(mm)": round(r["amp_mm"], 2),
             "각도 보정": "안 함" if no_corr else "함", "θ(°)": np.nan if no_corr else round(r["theta_deg"], 1), "각진폭(°)": round(r["ang_amp_deg"], 3),
-            "표적이탈(cm)": round(r["target_dev_cm"], 2) if posture else np.nan,
-            "레이저 높이(cm)": cs["hL"], "사각형 아래 선 높이(cm)": np.nan if no_corr else cs["hB"], "거리(cm)": D_cm,
-            "모눈 크기(cm)": cell_cm,
+            "평균위치 이탈(cm)": round(dev, 2) if posture else np.nan,
+            "분석 구간(s)": f"{r['t'][0] - t[0]:.1f}~{r['t'][-1] - t[0]:.1f}",
+            "레이저 높이(cm)": np.nan if cs["hL"] is None else cs["hL"],
+            "점 높이(cm)": np.nan if no_corr else cs["h_dot"], "거리(cm)": D_cm,
+            "모눈 크기(cm)": cell_cm, "모눈 한 칸(px)": round(float(px), 1),
             "약 복용": med + (f" ({med_h}시간 후)" if med_h is not None else ""),
             "카페인": caffeine, "피로": fatigue, "긴장·불안": stress, "메모": memo,
             "선택 해상도": sel_res, "선택 프레임": sel_fps,
@@ -540,7 +688,7 @@ rows = [x for x in (row_rest, row_post) if x]
 if len(rows) < 2:
     st.info("두 영상을 모두 분석하면 여기서 비교할 수 있습니다.")
 else:
-    cmp_cols = ["떨림", "주파수(Hz)", "상대세기", "진폭(mm)", "각도 보정", "θ(°)", "각진폭(°)", "표적이탈(cm)"]
+    cmp_cols = ["떨림", "주파수(Hz)", "상대세기", "진폭(mm)", "각도 보정", "θ(°)", "각진폭(°)", "평균위치 이탈(cm)"]
     st.dataframe(pd.DataFrame(rows).set_index("조건")[cmp_cols].T.astype(str), use_container_width=True)
     rest_has = row_rest["떨림"] == "있음"
     post_has = row_post["떨림"] == "있음"
