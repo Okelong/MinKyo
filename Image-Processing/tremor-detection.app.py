@@ -574,9 +574,10 @@ def run_case(k, cs):
                    "분석이 실패하면 검출 감도를 낮추거나 '화면 전체에서 찾기'를 켜 보세요.")
 
     run_key = (vkey, roi, min_score, round(float(px), 3))
-    if st.button(f"{cond} 상태 분석 시작", type="primary", key=k + "go"):
+    if go_all:                                           # 5번의 "한 번에 분석" 버튼을 눌렀으면
         st.session_state[k + "ran"] = run_key
     if st.session_state.get(k + "ran") != run_key:
+        st.info("위의 '두 영상 한 번에 분석' 버튼을 누르면 분석합니다.")
         return None
     t, xp, yp, fps = track_cached(path, roi, min_score)
     gc.collect()
@@ -693,6 +694,11 @@ def run_case(k, cs):
 
 # ------------------------------------------------------------------ 5. 분석
 st.header("5. 분석")
+n_up = sum(cs["up"] is not None for cs in cases.values())
+go_all = st.button("두 영상 한 번에 분석 (이완 → 긴장 순서)", type="primary", disabled=n_up == 0)
+if n_up == 1:
+    st.caption("영상이 하나만 올라와 있어 그 영상만 분석합니다.")
+st.caption("두 영상을 동시에가 아니라 차례로 처리합니다(서버 메모리 보호). 영상 길이에 따라 1~2분 걸릴 수 있습니다.")
 tab1, tab2 = st.tabs(["이완 상태 (안정시)", "긴장 상태 (자세 유지)"])
 with tab1:
     row_rest = run_case("rest_", cases["rest_"])
