@@ -296,20 +296,25 @@ st.caption("영상을 올리면 실제 해상도와 프레임을 파일에서 �
 
 # ------------------------------------------------------------------ 4. 영상 올리기
 st.header("4. 영상 올리기")
-st.caption("각도 계산을 위해, 촬영할 때 바닥에서 레이저까지의 높이와 바닥에서 모눈 사각형 아래 선까지의 높이를 재서 넣어 주세요.")
+st.caption("각도 계산을 위해 바닥에서 레이저까지의 높이와 바닥에서 모눈 사각형 아래 선까지의 높이를 넣어 주세요. "
+           "아래 선 높이를 모르면 '모름'을 체크하세요. 이때는 빛의 기울기 보정 없이 계산합니다.")
 left, right = st.columns(2)
 cases = {}
 with left:
     st.subheader("이완 상태 (안정시)")
     up = st.file_uploader("이완 상태 영상", type=["mp4", "mov", "m4v", "avi"], key="rest_up")
     hL = st.number_input("바닥 → 레이저 높이 (cm)", 0.0, 300.0, 90.0, 0.5, key="rest_hL")
-    hB = st.number_input("바닥 → 모눈 사각형 아래 선 높이 (cm)", 0.0, 300.0, 70.0, 0.5, key="rest_hB")
+    hB_unknown = st.checkbox("모눈 사각형 아래 선 높이를 모름", key="rest_hBno",
+                             help="모르면 빛의 기울기 보정을 하지 않습니다. 주파수에는 영향이 없습니다.")
+    hB = None if hB_unknown else st.number_input("바닥 → 모눈 사각형 아래 선 높이 (cm)", 0.0, 300.0, 70.0, 0.5, key="rest_hB")
     cases["rest_"] = dict(cond="이완", up=up, hL=hL, hB=hB, target=None)
 with right:
     st.subheader("긴장 상태 (자세 유지)")
     up = st.file_uploader("긴장 상태 영상", type=["mp4", "mov", "m4v", "avi"], key="post_up")
     hL = st.number_input("바닥 → 레이저 높이 (cm)", 0.0, 300.0, 120.0, 0.5, key="post_hL")
-    hB = st.number_input("바닥 → 모눈 사각형 아래 선 높이 (cm)", 0.0, 300.0, 115.0, 0.5, key="post_hB")
+    hB_unknown = st.checkbox("모눈 사각형 아래 선 높이를 모름", key="post_hBno",
+                             help="모르면 빛의 기울기 보정을 하지 않습니다. 주파수에는 영향이 없습니다.")
+    hB = None if hB_unknown else st.number_input("바닥 → 모눈 사각형 아래 선 높이 (cm)", 0.0, 300.0, 115.0, 0.5, key="post_hB")
     cases["post_"] = dict(cond="긴장", up=up, hL=hL, hB=hB, target="ask")
 
 
@@ -449,13 +454,18 @@ def run_case(k, cs):
     m[1].metric("주파수", f"{r['peak_hz']:.2f} Hz",
                 f"피크 간격 {r['interval_hz']:.2f} Hz" if np.isfinite(r["interval_hz"]) else None, delta_color="off")
     m[2].metric("벽에서 진폭", f"{r['amp_mm']:.2f} mm")
-    m[3].metric("겉보기 각진폭", f"{r['ang_amp_deg']:.3f}°", f"빛의 기울기 θ {r['theta_deg']:.1f}°", delta_color="off")
+    no_corr = cs["hB"] is None
+    m[3].metric("겉보기 각진폭", f"{r['ang_amp_deg']:.3f}°",
+                "각도 보정 안 됨" if no_corr else f"빛의 기울기 θ {r['theta_deg']:.1f}°", delta_color="off")
     if posture:
         st.metric("표적 점에서 평균 이탈 거리", f"{r['target_dev_cm']:.2f} cm")
 
     warns = []
     if r["missing_ratio"] > 0.1:
         warns.append(f"분석 구간의 {r['missing_ratio'] * 100:.0f}%에서 레이저 점을 찾지 못했습니다.")
+    if no_corr:
+        warns.append("모눈 사각형 아래 선 높이를 몰라 빛의 기울기 보정을 하지 않았습니다. "
+                     "손이 많이 처졌다면 각진폭이 실제보다 크게 나올 수 있습니다. 주파수에는 영향이 없습니다.")
     if r["theta_deg"] > 25:
         warns.append("빛의 기울기가 25°보다 큽니다. 진폭 보정 오차가 커질 수 있습니다.")
     mx, my = r["mean_pos"]
@@ -505,9 +515,9 @@ def run_case(k, cs):
     return {"차시": int(trial), "조건": cond, "손": hand, "떨림": "있음" if has else "없음",
             "주파수(Hz)": round(r["peak_hz"], 2), "피크간격(Hz)": round(r["interval_hz"], 2),
             "상대세기": round(r["rel_power"], 2), "진폭(mm)": round(r["amp_mm"], 2),
-            "θ(°)": round(r["theta_deg"], 1), "각진폭(°)": round(r["ang_amp_deg"], 3),
+            "각도 보정": "안 함" if no_corr else "함", "θ(°)": np.nan if no_corr else round(r["theta_deg"], 1), "각진폭(°)": round(r["ang_amp_deg"], 3),
             "표적이탈(cm)": round(r["target_dev_cm"], 2) if posture else np.nan,
-            "레이저 높이(cm)": cs["hL"], "사각형 아래 선 높이(cm)": cs["hB"], "거리(cm)": D_cm,
+            "레이저 높이(cm)": cs["hL"], "사각형 아래 선 높이(cm)": np.nan if no_corr else cs["hB"], "거리(cm)": D_cm,
             "모눈 크기(cm)": cell_cm,
             "약 복용": med + (f" ({med_h}시간 후)" if med_h is not None else ""),
             "카페인": caffeine, "피로": fatigue, "긴장·불안": stress, "메모": memo,
@@ -530,8 +540,8 @@ rows = [x for x in (row_rest, row_post) if x]
 if len(rows) < 2:
     st.info("두 영상을 모두 분석하면 여기서 비교할 수 있습니다.")
 else:
-    cmp_cols = ["떨림", "주파수(Hz)", "상대세기", "진폭(mm)", "θ(°)", "각진폭(°)", "표적이탈(cm)"]
-    st.dataframe(pd.DataFrame(rows).set_index("조건")[cmp_cols].T, use_container_width=True)
+    cmp_cols = ["떨림", "주파수(Hz)", "상대세기", "진폭(mm)", "각도 보정", "θ(°)", "각진폭(°)", "표적이탈(cm)"]
+    st.dataframe(pd.DataFrame(rows).set_index("조건")[cmp_cols].T.astype(str), use_container_width=True)
     rest_has = row_rest["떨림"] == "있음"
     post_has = row_post["떨림"] == "있음"
     if rest_has:
