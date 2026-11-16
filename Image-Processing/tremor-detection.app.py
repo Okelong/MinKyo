@@ -282,6 +282,27 @@ def judge(res, cond, rel_thr=0.3):
     return has, msgs
 
 
+def detect_tremor(res, rel_thr=0.3, amp_thr_deg=0.5, agree_hz=1.0, edge_hz=0.3):
+    """떨림 감지 = 주파수, 피크, 세기 세 조건을 모두 만족할 때.
+    1) 주파수: 피크가 분석 대역(2 Hz 이하 제거, 회의 결정) 안이고 대역 끝에 붙어 있지 않음
+    2) 피크: 한 주파수에 뚜렷이 몰림(상대 세기) + 봉우리 간격으로 잰 주파수와 일치(규칙적 반복)
+    3) 세기: 겉보기 각진폭이 최소 각도 이상 (생리적 미세 떨림 거르기)"""
+    lo, hi = BAND[0], float(res["freqs"][res["freqs"] <= min(BAND[1], 0.45 * res["fs"])].max())
+    f = res["peak_hz"]
+    c_freq = (lo + edge_hz) <= f <= (hi - edge_hz)
+    c_rel = res["rel_power"] >= rel_thr
+    c_agree = bool(np.isfinite(res["interval_hz"]) and abs(res["interval_hz"] - f) <= agree_hz)
+    c_amp = res.get("ang_amp_deg", 0.0) >= amp_thr_deg
+    checks = [
+        ("주파수", f"{f:.2f} Hz", f"{lo + edge_hz:.1f}~{hi - edge_hz:.1f} Hz 안", c_freq),
+        ("피크 뚜렷함", f"상대 세기 {res['rel_power']:.2f}", f"{rel_thr:.2f} 이상", c_rel),
+        ("피크 규칙성", "간격 " + (f"{res['interval_hz']:.2f} Hz" if np.isfinite(res["interval_hz"]) else "못 잼"),
+         f"FFT 피크와 ±{agree_hz:.1f} Hz 안", c_agree),
+        ("떨림 세기", f"각진폭 {res.get('ang_amp_deg', 0.0):.3f}°", f"{amp_thr_deg:.2f}° 이상", c_amp),
+    ]
+    return bool(c_freq and c_rel and c_agree and c_amp), checks
+
+
 # ---------------------------------------------------------------- 모눈 자동 인식
 def paper_roi(rgb):
     """첫 화면에서 가장 큰 밝은 영역(종이)의 사각형 (x0, y0, x1, y1). 못 찾으면 None."""
@@ -361,7 +382,7 @@ def grid_pitch(rgb, roi=None):
     return dict(ok=bool(same and q > 0.15), px=px, px_x=px_x, px_y=px_y, quality=q)
 
 
-core = types.SimpleNamespace(preview=preview, paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
+core = types.SimpleNamespace(detect_tremor=detect_tremor, preview=preview, paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
 # ====================== 화면 부분 ======================
 import gc
 # 화면에 보여야 할 것 (이용자 입력)
@@ -396,7 +417,12 @@ with st.sidebar.expander("고급 설정"):
     skip_s = st.number_input("앞부분 제외 (초, 직접 제외일 때)", 0.0, 10.0, 3.0, 0.5)
     win_s = st.number_input("최대 분석 시간 (초)", 2.0, 60.0, 10.0, 1.0)
     min_score = st.slider("레이저 검출 감도 (낮을수록 예민)", 20, 150, 60)
-    rel_thr = st.slider("떨림 판단 기준 (상대 세기)", 0.1, 0.8, 0.3, 0.05)
+    rel_thr = st.slider("피크 뚜렷함 기준 (상대 세기)", 0.1, 0.8, 0.3, 0.05)
+    amp_thr = st.number_input("떨림 세기 기준 (최소 각진폭 °)", 0.0, 10.0, 0.5, 0.05,
+                              help="임시값입니다. 건강한 조원들의 측정값보다 높게 다시 정하세요.")
+    agree_hz = st.number_input("피크 규칙성 허용 차이 (Hz)", 0.2, 3.0, 1.0, 0.1)
+    pd_lo, pd_hi = st.slider("파킨슨 안정시 떨림 주파수 범위 (Hz)", 2.0, 14.0, (4.0, 6.0), 0.5,
+                             help="발표자료 9번 슬라이드의 기준(4-6 Hz)")
 
 # ------------------------------------------------------------------ 1. 측정 정보
 st.header("1. 측정 정보")
@@ -594,7 +620,7 @@ def run_case(k, cs):
     except ValueError as e:
         st.error(str(e))
         return None
-    has = r["rel_power"] >= rel_thr
+    has, checks = core.detect_tremor(r, rel_thr, amp_thr, agree_hz)
 
     st.markdown(f"### {cond} 상태 결과")
     used0, used1 = r["t"][0] - t[0], r["t"][-1] - t[0]
@@ -613,12 +639,21 @@ def run_case(k, cs):
         plt.close(fig)
     else:
         st.info(f"영상의 {used0:.1f}초 ~ {used1:.1f}초를 분석했습니다.")
+    in_pd = pd_lo <= r["peak_hz"] <= pd_hi
     if has:
-        st.warning(f"떨림이 감지되었습니다. 초당 약 {r['peak_hz']:.1f}회({r['peak_hz']:.1f} Hz) 떨립니다.")
+        st.warning(f"떨림이 감지되었습니다. 초당 약 {r['peak_hz']:.1f}회({r['peak_hz']:.1f} Hz) 떨립니다. "
+                   + (f"파킨슨 안정시 떨림 주파수 범위({pd_lo:.1f}~{pd_hi:.1f} Hz)에 해당합니다." if in_pd
+                      else f"파킨슨 안정시 떨림 주파수 범위({pd_lo:.1f}~{pd_hi:.1f} Hz) 밖입니다."))
+    elif all(c[3] for c in checks[:3]):
+        st.success("규칙적인 떨림 성분은 있지만 세기가 기준보다 작아 '감지 안 됨'으로 판단했습니다 "
+                   "(건강한 사람에게도 있는 미세한 떨림일 수 있습니다).")
     else:
         st.success("뚜렷한 떨림이 감지되지 않았습니다. 표시된 주파수는 참고값입니다.")
+    st.dataframe(pd.DataFrame([{"조건": a, "측정값": b, "기준": c_, "통과": "O" if ok else "X"}
+                               for a, b, c_, ok in checks]), hide_index=True, use_container_width=True)
+    st.caption("네 조건을 모두 통과해야 '떨림 감지'입니다. 세기 기준은 근거 문헌이 없는 임시값입니다.")
     m = st.columns(4)
-    m[0].metric("떨림", "감지됨" if has else "감지 안 됨", f"상대 세기 {r['rel_power']:.2f}", delta_color="off")
+    m[0].metric("떨림", "감지됨" if has else "감지 안 됨", f"{sum(c[3] for c in checks)}/4 조건 통과", delta_color="off")
     m[1].metric("주파수", f"{r['peak_hz']:.2f} Hz",
                 f"피크 간격 {r['interval_hz']:.2f} Hz" if np.isfinite(r["interval_hz"]) else None, delta_color="off")
     m[2].metric("벽에서 진폭", f"{r['amp_mm']:.2f} mm")
@@ -677,6 +712,8 @@ def run_case(k, cs):
                        f"coords_{k}{hand}_{int(trial)}차.csv", "text/csv", key=k + "dl")
 
     return {"차시": int(trial), "조건": cond, "손": hand, "떨림": "있음" if has else "없음",
+            "파킨슨 주파수 범위": ("해당" if in_pd else "밖") if has else "-",
+            "통과 조건": ", ".join(c[0] for c in checks if c[3]) or "없음",
             "주파수(Hz)": round(r["peak_hz"], 2), "피크간격(Hz)": round(r["interval_hz"], 2),
             "상대세기": round(r["rel_power"], 2), "진폭(mm)": round(r["amp_mm"], 2),
             "각도 보정": "안 함" if no_corr else "함", "θ(°)": np.nan if no_corr else round(r["theta_deg"], 1), "각진폭(°)": round(r["ang_amp_deg"], 3),
@@ -711,20 +748,25 @@ rows = [x for x in (row_rest, row_post) if x]
 if len(rows) < 2:
     st.info("두 영상을 모두 분석하면 여기서 비교할 수 있습니다.")
 else:
-    cmp_cols = ["떨림", "주파수(Hz)", "상대세기", "진폭(mm)", "각도 보정", "θ(°)", "각진폭(°)", "평균위치 이탈(cm)"]
+    cmp_cols = ["떨림", "파킨슨 주파수 범위", "주파수(Hz)", "상대세기", "진폭(mm)", "각도 보정", "θ(°)", "각진폭(°)", "평균위치 이탈(cm)"]
     st.dataframe(pd.DataFrame(rows).set_index("조건")[cmp_cols].T.astype(str), use_container_width=True)
     rest_has = row_rest["떨림"] == "있음"
     post_has = row_post["떨림"] == "있음"
-    if rest_has:
-        st.warning("힘을 빼고 쉬고 있을 때 떨림이 감지되었습니다. 신경과 진료를 받아 보시길 권합니다.")
+    rest_pd = rest_has and row_rest["파킨슨 주파수 범위"] == "해당"
+    if rest_pd:
+        st.error(f"힘을 빼고 쉬고 있을 때 파킨슨 안정시 떨림 주파수 범위({pd_lo:.1f}~{pd_hi:.1f} Hz)의 떨림이 감지되었습니다. "
+                 "신경과 진료를 받아 보시길 권합니다.")
+    elif rest_has:
+        st.warning(f"힘을 빼고 쉬고 있을 때 떨림이 감지되었습니다({row_rest['주파수(Hz)']:.1f} Hz, "
+                   "파킨슨 안정시 떨림 주파수 범위 밖). 떨림이 계속되면 진료를 받아 보세요.")
     if post_has and not rest_has:
         st.info("팔을 뻗고 있을 때만 떨림이 감지되었습니다. 떨림이 계속되거나 생활에 불편하면 진료를 받아 보세요.")
     if not rest_has and not post_has:
         st.success("두 조건 모두 뚜렷한 떨림이 감지되지 않았습니다.")
     if rest_has and post_has:
         st.write(f"두 조건의 주파수 차이: {abs(row_rest['주파수(Hz)'] - row_post['주파수(Hz)']):.2f} Hz")
-    st.caption("겉보기 각진폭은 같은 사람의 두 조건을 비교하는 용도입니다. "
-               "주파수나 진폭만으로 파킨슨병과 본태성 떨림을 구별할 수 없습니다.")
+    st.caption("주파수 범위에 해당한다고 파킨슨병이라는 뜻은 아닙니다. 본태성 떨림도 이 범위에 들 수 있어, "
+               "진단은 의사가 다른 소견과 함께 합니다.")
 
 if "history" not in st.session_state:
     st.session_state["history"] = []
