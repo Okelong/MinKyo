@@ -32,6 +32,14 @@ def read_frames_info(path):
     return dict(fps=fps, n=n, w=w, h=h, first=cv2.cvtColor(first, cv2.COLOR_BGR2RGB))
 
 
+def preview(rgb, max_w=1280):
+    """화면 표시용 축소본과 배율 (4K 그림을 그대로 그리면 메모리를 많이 씀)."""
+    s = min(1.0, max_w / rgb.shape[1])
+    if s >= 1.0:
+        return rgb, 1.0
+    return cv2.resize(rgb, (int(rgb.shape[1] * s), int(rgb.shape[0] * s)), interpolation=cv2.INTER_AREA), s
+
+
 def resolution_label(w, h):
     s = min(w, h)
     if s >= 2160:
@@ -70,16 +78,16 @@ def detect_dot(frame_bgr, roi=None, min_score=60):
     score = R - (G+B)/2 : 빨간 정도. 점 가운데가 하얗게 포화돼도
     주변의 붉은 테두리로 중심을 잡도록, 밝기 가중 중심을 쓴다.
     """
+    ox, oy = 0, 0
+    if roi is not None:                                  # 관심 영역만 잘라서 계산 (메모리·속도 절약)
+        x0, y0, x1, y1 = roi
+        frame_bgr = frame_bgr[y0:y1, x0:x1]
+        ox, oy = x0, y0
     img = frame_bgr.astype(np.int16)
     b, g, r = img[..., 0], img[..., 1], img[..., 2]
     score = r - (g + b) // 2
     bright = (r > 200) & (g > 200) & (b > 200)          # 과노출된 점 중심
-    if roi is not None:
-        x0, y0, x1, y1 = roi
-        mask = np.zeros(score.shape, bool)
-        mask[y0:y1, x0:x1] = True
-        score = np.where(mask, score, -255)
-        bright &= mask
+    del img, b, g
     smax = score.max()
     if smax < min_score:
         return None
@@ -92,7 +100,7 @@ def detect_dot(frame_bgr, roi=None, min_score=60):
     k = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])     # 가장 큰 덩어리 = 레이저 점
     ys, xs = np.nonzero(lab == k)
     w = np.clip(score[ys, xs], 1, None).astype(float)
-    return float((xs * w).sum() / w.sum()), float((ys * w).sum() / w.sum())
+    return float((xs * w).sum() / w.sum()) + ox, float((ys * w).sum() / w.sum()) + oy
 
 
 def track_video(path, roi=None, min_score=60, progress=None):
@@ -353,8 +361,9 @@ def grid_pitch(rgb, roi=None):
     return dict(ok=bool(same and q > 0.15), px=px, px_x=px_x, px_y=px_y, quality=q)
 
 
-core = types.SimpleNamespace(paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
+core = types.SimpleNamespace(preview=preview, paper_roi=paper_roi, grid_pitch=grid_pitch, auto_window=auto_window, BAND=BAND, read_frames_info=read_frames_info, resolution_label=resolution_label, frame_timing=frame_timing, detect_dot=detect_dot, track_video=track_video, homography=homography, to_wall=to_wall, analyze=analyze, judge=judge)
 # ====================== 화면 부분 ======================
+import gc
 # 화면에 보여야 할 것 (이용자 입력)
 # 1. 측정 정보: 몇 차시인지, 사용한 손, 사용한 모눈 크기, 벽까지 거리
 # 2. 측정 당시 상태
@@ -457,8 +466,13 @@ def track_cached(p, roi_, ms_):
     return core.track_video(p, roi_, ms_)
 
 
+@st.cache_data(show_spinner=False)
+def timing_cached(p):
+    return core.frame_timing(p)
+
+
 def save_upload(up):
-    data = up.getvalue()
+    data = up.getbuffer()                                # 복사 없이 읽기 (메모리 절약)
     key = hashlib.md5(data).hexdigest()
     path = os.path.join(tempfile.gettempdir(), f"laser_{key}{os.path.splitext(up.name)[1] or '.mp4'}")
     if not os.path.exists(path):
@@ -469,7 +483,7 @@ def save_upload(up):
 
 def camera_auto(path, info):
     """파일에서 읽은 실제 해상도·프레임을 보여 주고, 사용자가 고른 값과 비교한다."""
-    tm = core.frame_timing(path)
+    tm = timing_cached(path)
     dur = tm["duration"] if tm["ok"] else (info["n"] / info["fps"] if info["fps"] else 0)
     fps_real = tm["fps_real"] if tm["ok"] else info["fps"]
     lab = core.resolution_label(info["w"], info["h"])
@@ -536,18 +550,20 @@ def run_case(k, cs):
 
     first_bgr = info["first"][..., ::-1].copy()
     dot0 = core.detect_dot(first_bgr, roi, min_score)
-    fig, ax = plt.subplots(figsize=(9, 9 * Hh / W))
-    ax.imshow(info["first"])
+    pv, ps = core.preview(info["first"])                 # 화면 표시용 축소본 (ps = 축소 배율)
+    fig, ax = plt.subplots(figsize=(9, 9 * Hh / W), dpi=80)
+    ax.imshow(pv)
     if roi is not None:
-        ax.add_patch(plt.Rectangle((roi[0], roi[1]), roi[2] - roi[0], roi[3] - roi[1],
+        ax.add_patch(plt.Rectangle((roi[0] * ps, roi[1] * ps), (roi[2] - roi[0]) * ps, (roi[3] - roi[1]) * ps,
                                    fill=False, ls="--", color="#eb6834", lw=1.5))
-    cx = (roi[0] + roi[2]) / 2 if roi else W / 2
-    cy = (roi[1] + roi[3]) / 2 if roi else Hh / 2
+    cx = ((roi[0] + roi[2]) / 2 if roi else W / 2) * ps
+    cy = ((roi[1] + roi[3]) / 2 if roi else Hh / 2) * ps
+    pp = px * ps
     for i in range(-5, 6):                               # 인식한 간격으로 그린 확인용 눈금
-        ax.plot([cx + i * px] * 2, [cy - 5 * px, cy + 5 * px], color="yellow", lw=0.8)
-        ax.plot([cx - 5 * px, cx + 5 * px], [cy + i * px] * 2, color="yellow", lw=0.8)
+        ax.plot([cx + i * pp] * 2, [cy - 5 * pp, cy + 5 * pp], color="yellow", lw=0.8)
+        ax.plot([cx - 5 * pp, cx + 5 * pp], [cy + i * pp] * 2, color="yellow", lw=0.8)
     if dot0:
-        ax.plot(*dot0, "+", color="red", ms=18, mew=2)
+        ax.plot(dot0[0] * ps, dot0[1] * ps, "+", color="red", ms=18, mew=2)
     ax.axis("off")
     st.pyplot(fig)
     plt.close(fig)
@@ -563,6 +579,7 @@ def run_case(k, cs):
     if st.session_state.get(k + "ran") != run_key:
         return None
     t, xp, yp, fps = track_cached(path, roi, min_score)
+    gc.collect()
     xw, yw = xp * kcm, (Hh - yp) * kcm                  # 화면 픽셀 → 벽 cm (위쪽이 +y)
     try:
         aw = None
