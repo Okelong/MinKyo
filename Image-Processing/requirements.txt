@@ -1,6 +1,6 @@
-   streamlit
-   numpy
-   scipy
-   matplotlib
-   pandas
-   pillow
+streamlit
+numpy
+scipy
+pandas
+matplotlib
+opencv-python-headless
